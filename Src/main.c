@@ -39,6 +39,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <stdint.h>
 #include <stdbool.h>
 #include "btldr_config.h"
+#include "crypt.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -102,7 +103,7 @@ void jmp_to_appcode()
 
 bool is_button_down()
 {
-  return (HAL_GPIO_ReadPin(BTLDR_EN_GPIO_Port, BTLDR_EN_Pin) == GPIO_PIN_RESET);
+    return (!LL_GPIO_IsInputPinSet(BTLDR_EN_GPIO_Port, BTLDR_EN_Pin) );
 }
 
 /* USER CODE END 0 */
@@ -141,6 +142,9 @@ int main(void)
 
   if(!is_appcode_exist() || is_button_down())
   {
+#if(CONFIG_SUPPORT_CRYPT_MODE > 0u)
+    crypt_init();
+#endif
     MX_USB_DEVICE_Init();
     while(1)
     {

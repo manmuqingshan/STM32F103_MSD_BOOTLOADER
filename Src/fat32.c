@@ -16,6 +16,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include "stm32f1xx_hal.h"
 #include "btldr_config.h"
 #include "fat32.h"
+#include "ihex_parser.h"
+#include "crypt.h"
 
 //-------------------------------------------------------
 
@@ -103,15 +105,16 @@ typedef __packed struct
 
 //-------------------------------------------------------
 
-typedef struct
+typedef union
 {
-    uint32_t begin;
-    uint32_t end;
-}fat32_range_t;
+  uint8_t buf[4];
+  uint32_t value32;
+}uint32x_t;               // used for flash align write
+
+//-------------------------------------------------------
 
 #define FAT32_DIR_ENTRY_ADDR         0x00400000
-
-static fat32_range_t fw_addr_range = {0x00400600, (0x00400600 + APP_SIZE)};
+#define FAT32_FIRMWARE_BIN_ADDR      0x00400600
 
 //-------------------------------------------------------
 
@@ -166,7 +169,7 @@ static void _fat32_read_bpb(uint8_t *b)
     //bpb->BS_Reserved1;
     bpb->BS_BootSig = 0x29;
     bpb->BS_VolID = 0x94B11E23;
-    memcpy(bpb->BS_VolLab, "NO NAME    ", 11);
+    memcpy(bpb->BS_VolLab, "BOOTLOADER ", 11);
     memcpy(bpb->BS_FilSysType, "FAT32   ", 8);
     
     b[510] = 0x55;
@@ -253,9 +256,9 @@ static void _fat32_read_dir_entry(uint8_t *b)
     dir->DIR_Attr = FAT32_ATTR_VOLUME_ID;
     dir->DIR_NTRes = 0x00;
     dir->DIR_CrtTimeTenth = 0x00;
-    dir->DIR_CrtTime = 0x0000;
-    dir->DIR_CrtDate = 0x0000;
-    dir->DIR_LstAccDate = 0x0000;
+    dir->DIR_CrtTime = FAT32_MAKE_TIME(0,0);
+    dir->DIR_CrtDate = FAT32_MAKE_DATE(28,04,2020);
+    dir->DIR_LstAccDate = FAT32_MAKE_DATE(28,04,2020);
     dir->DIR_FstClusHI = 0x0000;
     dir->DIR_WrtTime = FAT32_MAKE_TIME(0,0);
     dir->DIR_WrtDate = FAT32_MAKE_DATE(28,04,2020);
@@ -282,7 +285,7 @@ static void _fat32_read_dir_entry(uint8_t *b)
 static void _fat32_read_firmware(uint8_t *b, uint32_t addr)
 {
 #if (CONFIG_READ_FLASH > 0u)
-    uint32_t offset = addr - fw_addr_range.begin;
+    uint32_t offset = addr - FAT32_FIRMWARE_BIN_ADDR;
     uint32_t addr_end = MIN(offset + FAT32_SECTOR_SIZE, APP_SIZE);
     int32_t total_size = addr_end - offset;
     
@@ -292,7 +295,7 @@ static void _fat32_read_firmware(uint8_t *b, uint32_t addr)
 #endif
 }
 
-static bool _fat32_write_firmware(const uint8_t *b, uint32_t addr)
+static bool _fat32_write_firmware(uint32_t phy_addr, const uint8_t *buf, uint8_t size)
 {
     bool return_status = true;
   
@@ -300,16 +303,20 @@ static bool _fat32_write_firmware(const uint8_t *b, uint32_t addr)
     
     HAL_FLASH_Unlock();
     
-    uint32_t offset = addr - fw_addr_range.begin;
-    uint32_t phy_addr = APP_ADDR + offset;
-    uint32_t prog_size = MIN(FAT32_SECTOR_SIZE, fw_addr_range.end - fw_addr_range.begin);
-  
-    if(prog_size & 0x03)
+#if (CONFIG_SUPPORT_CRYPT_MODE > 0u)
+    
+    if(ihex_is_crypt_mode())
     {
-        prog_size += 4;
+      if(size != AES_BLOCKLEN)
+      {
+          return false;
+      }
+      
+      crypt_decrypt((uint8_t*)buf, size, phy_addr);
     }
-  
-    if(addr == fw_addr_range.begin)
+#endif
+    
+    if(phy_addr == APP_ADDR)
     {
         // Erase the APPCODE area
         uint32_t PageError = 0;
@@ -317,7 +324,7 @@ static bool _fat32_write_firmware(const uint8_t *b, uint32_t addr)
         
         eraseinitstruct.TypeErase = FLASH_TYPEERASE_PAGES;
         eraseinitstruct.PageAddress = APP_ADDR;
-        eraseinitstruct.NbPages = APP_SIZE / DEV_ERASE_PAGE_SIZE;
+        eraseinitstruct.NbPages = APP_SIZE / FLASH_PAGE_SIZE;
         status = HAL_FLASHEx_Erase(&eraseinitstruct, &PageError);
         
         if(status != HAL_OK)
@@ -326,29 +333,61 @@ static bool _fat32_write_firmware(const uint8_t *b, uint32_t addr)
             goto EXIT;
         }
     }
-    
-    
-    if((phy_addr >= APP_ADDR) && (phy_addr < (APP_ADDR + APP_SIZE)) )
-    {
-        uint32_t i = 0;
       
-        for(i=0; i<prog_size; i+=4)
+    if((phy_addr >= APP_ADDR) && ((phy_addr+size) <= (APP_ADDR + APP_SIZE)) )
+    {
+        uint8_t unalign = phy_addr & 0x03;    // support unalign write
+        uint32x_t content;
+      
+        if(unalign)
         {
-            const uint8_t *wbuf = b + i;
-            status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, phy_addr + i, *((uint32_t*)wbuf));
-            if(status != HAL_OK)
+            uint32_t prog_addr = phy_addr & ~(0x03);
+            uint8_t prog_size = MIN(size, 4-unalign);
+            
+            content.buf[0] = 0xFF;
+            content.buf[1] = 0xFF;
+            content.buf[2] = 0xFF;
+            content.buf[3] = 0xFF;
+        
+            uint8_t i;
+            for(i=0; i<prog_size; i++)
             {
-                return_status = false;
-                goto EXIT;
+                content.buf[i+unalign] = *buf++;
+                ++phy_addr;
+                --size;
             }
+            HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, prog_addr, content.value32);
+        }
+      
+        while(size >= 4)
+        {
+            content.buf[0] = buf[0];
+            content.buf[1] = buf[1];
+            content.buf[2] = buf[2];
+            content.buf[3] = buf[3];
+            
+            HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, phy_addr, content.value32);
+            phy_addr += 4;
+            buf += 4;
+            size -= 4;
+        }
+        
+        if(size)  // write remaining byte
+        {
+            content.buf[0] = 0xFF;
+            content.buf[1] = 0xFF;
+            content.buf[2] = 0xFF;
+            content.buf[3] = 0xFF;
+            
+            uint8_t i;
+            for(i=0; i<size; i++)
+            {
+                content.buf[i] = *buf++;
+            }
+            HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, phy_addr, content.value32);
         }
     }
     
-    //if(addr == (fw_addr_range.end - FAT32_SECTOR_SIZE))
-    //{
-      // DownloadComplete();
-    //  return_status = true;
-    //}
 EXIT:
     HAL_FLASH_Lock();
     return return_status;
@@ -385,7 +424,7 @@ bool fat32_read(uint8_t *b, uint32_t addr)
     {
         _fat32_read_dir_entry(b);
     }
-    else if(addr >= fw_addr_range.begin && addr < fw_addr_range.end)
+    else if(addr >= FAT32_FIRMWARE_BIN_ADDR && addr < (FAT32_FIRMWARE_BIN_ADDR+APP_SIZE))
     {
         _fat32_read_firmware(b, addr);
     }
@@ -404,8 +443,6 @@ bool fat32_write(const uint8_t *b, uint32_t addr)
         return false;
     }
     
-    uint32_t align_addr_end = (fw_addr_range.end & ~(FAT32_SECTOR_SIZE-1)) + ((fw_addr_range.end & (FAT32_SECTOR_SIZE-1)) ? FAT32_SECTOR_SIZE : 0);
-    
     if(addr < FAT32_DIR_ENTRY_ADDR)
     {
       // No operation
@@ -417,26 +454,24 @@ bool fat32_write(const uint8_t *b, uint32_t addr)
         {
             const uint8_t *b_offset = (const uint8_t *)(b + i);
             fat32_dir_entry_t *entry = (fat32_dir_entry_t*)b_offset;
-             
-            if(memcmp((void*) &entry->DIR_Name[8], "BIN", 3) == 0)
+            
+            uint8_t *filename = entry->DIR_Name;
+
+            if(filename[8] == 'H' && filename[9] == 'E' && filename[10] == 'X')
             {
-                uint32_t clus = (((uint32_t)(entry->DIR_FstClusHI)) << 16) | entry->DIR_FstClusLO;
+                ihex_reset_state();
+                
+                // uint32_t clus = (((uint32_t)(entry->DIR_FstClusHI)) << 16) | entry->DIR_FstClusLO;
               
-                fw_addr_range.begin = ((clus-2) + 0x2000 ) * FAT32_SECTOR_SIZE;
-                fw_addr_range.end = fw_addr_range.begin + MIN(entry->DIR_FileSize, APP_SIZE);
+                // fw_addr_range.begin = ((clus-2) + 0x2000 ) * FAT32_SECTOR_SIZE;
+                // fw_addr_range.end = fw_addr_range.begin + entry->DIR_FileSize;       // don't know the size of HEX file
             }
-        }
-    }
-    else if(addr >= fw_addr_range.begin && addr < align_addr_end)
-    {
-        if(!_fat32_write_firmware(b, addr))
-        {
-            return false;
         }
     }
     else
     {
-        volatile uint8_t halt = 1;
+        ihex_set_callback_func(_fat32_write_firmware);
+        ihex_parser(b, FAT32_SECTOR_SIZE);
     }
     
     return true;
