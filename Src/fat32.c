@@ -42,7 +42,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 //-------------------------------------------------------
 
-typedef __packed struct 
+typedef struct
 {
     uint8_t BS_jmpBoot[3];
     uint8_t BS_OEMName[8];
@@ -73,9 +73,9 @@ typedef __packed struct
     uint32_t BS_VolID;
     uint8_t BS_VolLab[11];
     uint8_t BS_FilSysType[8];
-}fat32_bpb_t;
+}__attribute__((packed)) fat32_bpb_t  ;
 
-typedef __packed struct 
+typedef struct
 {
     uint32_t FSI_LeadSig;
     uint8_t FSI_Reserved1[480];
@@ -84,9 +84,9 @@ typedef __packed struct
     uint32_t FSI_Nxt_Free;
     uint8_t FSI_Reserved2[12];
     uint32_t FSI_TrailSig;
-}fat32_fsinfo_t;
+}__attribute__((packed)) fat32_fsinfo_t  ;
 
-typedef __packed struct 
+typedef struct
 {
     uint8_t DIR_Name[11];
     uint8_t DIR_Attr;
@@ -101,7 +101,7 @@ typedef __packed struct
     uint16_t DIR_WrtDate;
     uint16_t DIR_FstClusLO;
     uint32_t DIR_FileSize;
-}fat32_dir_entry_t;
+}__attribute__((packed)) fat32_dir_entry_t  ;
 
 //-------------------------------------------------------
 
@@ -114,7 +114,12 @@ typedef union
 //-------------------------------------------------------
 
 #define FAT32_DIR_ENTRY_ADDR         0x00400000
-#define FAT32_FIRMWARE_BIN_ADDR      0x00400600
+#define FAT32_README_TXT_ADDR        0x00400600
+#define FAT32_FIRMWARE_BIN_ADDR      0x00400800
+
+//-------------------------------------------------------
+
+static const char btldr_desc[] = "STM32 bootloader\nPlease drag and drop the intel hex file to this drive to update the appcode";
 
 //-------------------------------------------------------
 
@@ -264,7 +269,23 @@ static void _fat32_read_dir_entry(uint8_t *b)
     dir->DIR_WrtDate = FAT32_MAKE_DATE(28,04,2020);
     dir->DIR_FstClusLO = 0x0000;
     dir->DIR_FileSize = 0x00000000;
-    
+
+    ++dir;
+
+    memcpy(dir->DIR_Name, "README  TXT", 11);
+    dir->DIR_Attr = FAT32_ATTR_ARCHIVE | FAT32_ATTR_READ_ONLY;
+    dir->DIR_NTRes = 0x18;
+    dir->DIR_CrtTimeTenth = 0x00;
+    dir->DIR_CrtTime = FAT32_MAKE_TIME(0,0);
+    dir->DIR_CrtDate = FAT32_MAKE_DATE(28,04,2020);
+    dir->DIR_LstAccDate = FAT32_MAKE_DATE(28,04,2020);
+    dir->DIR_FstClusHI = 0x0000;
+    dir->DIR_WrtTime = FAT32_MAKE_TIME(0,0);
+    dir->DIR_WrtDate = FAT32_MAKE_DATE(28,04,2020);
+    dir->DIR_FstClusLO = 0x0005;
+    dir->DIR_FileSize = strlen(btldr_desc);
+
+#if (CONFIG_READ_FLASH > 0u)
     ++dir;
     
     memcpy(dir->DIR_Name, "FIRMWAREBIN", 11);
@@ -277,11 +298,18 @@ static void _fat32_read_dir_entry(uint8_t *b)
     dir->DIR_FstClusHI = 0x0000;
     dir->DIR_WrtTime = FAT32_MAKE_TIME(0,0);
     dir->DIR_WrtDate = FAT32_MAKE_DATE(28,04,2020);
-    dir->DIR_FstClusLO = 0x0005;
+    dir->DIR_FstClusLO = 0x0006;
     dir->DIR_FileSize = APP_SIZE;
+#endif
 }
 
 // Addr : 0x0040_0600
+static void _fat32_read_btldr_desc(uint8_t *b, uint32_t addr)
+{
+    memcpy(b, btldr_desc, sizeof(btldr_desc));
+}
+
+// Addr : 0x0040_0800
 static void _fat32_read_firmware(uint8_t *b, uint32_t addr)
 {
 #if (CONFIG_READ_FLASH > 0u)
@@ -423,6 +451,10 @@ bool fat32_read(uint8_t *b, uint32_t addr)
     else if(addr == FAT32_DIR_ENTRY_ADDR)
     {
         _fat32_read_dir_entry(b);
+    }
+    else if(addr >= FAT32_README_TXT_ADDR && addr < (FAT32_README_TXT_ADDR+FAT32_SECTOR_SIZE))
+    {
+        _fat32_read_btldr_desc(b, addr);
     }
     else if(addr >= FAT32_FIRMWARE_BIN_ADDR && addr < (FAT32_FIRMWARE_BIN_ADDR+APP_SIZE))
     {

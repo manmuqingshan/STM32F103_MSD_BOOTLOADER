@@ -41,6 +41,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include "btldr_config.h"
 #include "crypt.h"
 #include "ihex_parser.h"
+#include "crc.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -73,7 +75,8 @@ static void MX_GPIO_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-bool is_appcode_exist()
+#if (BTLDR_ACT_NoAppExist > 0u)
+bool is_appcode_exist(void)
 {
   uint32_t *mem = (uint32_t*)APP_ADDR;
   
@@ -89,18 +92,52 @@ bool is_appcode_exist()
     return true;
   }
 }
+#endif
 
-bool is_button_down()
+#if (BTLDR_ACT_CksNotVld > 0u)
+bool app_cks_valid(void)
+{
+	uint32_t app_crc32 = 0;
+
+	/* calculate CRC32 checksum from start of main application until CRC32 location */
+	app_crc32 = crc32_calculate((const uint8_t *)APP_ADDR, (CRC_ADDR-APP_ADDR));
+
+	/* compare self calculated CRC32 with CRC32 stored in flash */
+	return (app_crc32 == *((uint32_t*)(CRC_ADDR)));
+}
+#endif
+
+#if (BTLDR_ACT_ButtonPress > 0u)
+bool is_button_down(void)
 {
     return (!LL_GPIO_IsInputPinSet(BTLDR_EN_GPIO_Port, BTLDR_EN_Pin) );
 }
+#endif
+
+#if (BTLDR_ACT_BootkeyDet > 0u)
+
+volatile __attribute__((section("._bootkey_section.btldr_act_req_key"))) uint32_t btldr_act_req_key;
+
+bool bootkey_detected(void){
+    return(btldr_act_req_key == BOOTKEY);
+}
+#endif
 
 extern PCD_HandleTypeDef hpcd_USB_FS;
 
-void SystemReset(){
+void SystemReset(void){
     LL_mDelay(500);
+
     HAL_PCD_Stop(&hpcd_USB_FS);
+
+    /* Pull USB D+ PIN to GND so USB Host detects device disconnect */
+    LL_GPIO_SetPinMode(GPIOA,LL_GPIO_PIN_12, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_12, LL_GPIO_SPEED_FREQ_LOW);
+    LL_GPIO_SetPinOutputType(GPIOA,LL_GPIO_PIN_12, LL_GPIO_OUTPUT_PUSHPULL);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_12);
+
     LL_mDelay(1000);
+
     NVIC_SystemReset();
 }
 
@@ -141,7 +178,20 @@ int main(void)
   
   /* USER CODE BEGIN 2 */
 
-  if(!is_appcode_exist() || is_button_down())
+ if(	/* Check for configured activation options */
+    #if (BTLDR_ACT_NoAppExist > 0u)
+      !is_appcode_exist()
+    #endif
+    #if (BTLDR_ACT_ButtonPress > 0u)
+      || is_button_down()
+    #endif
+    #if (BTLDR_ACT_CksNotVld > 0u)
+      || !app_cks_valid()
+    #endif
+    #if (BTLDR_ACT_BootkeyDet > 0u)
+      || bootkey_detected()
+    #endif
+	 )
   {
 #if(CONFIG_SUPPORT_CRYPT_MODE > 0u)
     crypt_init();
@@ -151,6 +201,9 @@ int main(void)
     {
 #if (CONFIG_SOFT_RESET_AFTER_IHEX_EOF > 0u)
       if(ihex_is_eof()) {
+        #if (BTLDR_ACT_BootkeyDet > 0u)
+         btldr_act_req_key = 0;
+        #endif
          SystemReset();
       }
 #endif
@@ -161,7 +214,6 @@ int main(void)
     // Jump to the app code
 	jump_addr = *((__IO uint32_t*)(APP_ADDR+4u));
 	HAL_DeInit();
-	__disable_irq();
 
 	// Disable all interrupts
 	NVIC->ICER[0] = 0xFFFFFFFF;
